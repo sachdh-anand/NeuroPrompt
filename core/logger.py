@@ -5,14 +5,22 @@ Logging configuration with colored terminal output and clean log files.
 import logging
 import os
 import sys
+import io
+import re
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TextIO, Set
 
 from colorama import init, Fore, Style
 
 # Initialize colorama for Windows support
 init()
+
+# Regular expression to match ANSI escape sequences
+ANSI_ESCAPE_PATTERN = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+# Set to track messages already logged to prevent duplicates
+LOGGED_MESSAGES: Set[str] = set()
 
 class LogSymbols:
     """Symbols for different log levels and states."""
@@ -30,98 +38,184 @@ class LogSymbols:
     MODEL = "🤖"
 
 class ConsoleFormatter(logging.Formatter):
-    """Formatter for console output with colors and symbols."""
+    """Formatter for console output with colors."""
     
-    def format(self, record):
-        # Store original message and level
-        original_msg = record.msg
+    COLORS = {
+        'DEBUG': Fore.CYAN,
+        'INFO': Fore.GREEN,
+        'WARNING': Fore.YELLOW,
+        'ERROR': Fore.RED,
+        'CRITICAL': Fore.RED + Style.BRIGHT
+    }
+    
+    SYMBOLS = {
+        'DEBUG': LogSymbols.DEBUG,
+        'INFO': LogSymbols.INFO,
+        'WARNING': LogSymbols.WARNING,
+        'ERROR': LogSymbols.ERROR,
+        'CRITICAL': LogSymbols.CRITICAL
+    }
+    
+    def format(self, record: logging.LogRecord) -> str:
+        # Check if message already contains formatting
+        if hasattr(record, 'formatted') and record.formatted:
+            return super().format(record)
+        
+        log_color = self.COLORS.get(record.levelname, Fore.WHITE)
+        log_symbol = self.SYMBOLS.get(record.levelname, "")
+        
+        # Ensure consistent width for all log levels - padding to match WARNING (7 chars)
+        # Store original levelname for restoration later
         original_levelname = record.levelname
         
-        # Determine color and symbol first
-        symbol = LogSymbols.INFO
-        color = Fore.CYAN
-        
-        # Check log level and content to determine appropriate color and symbol
-        is_success = "success" in original_msg.lower() or "completed" in original_msg.lower()
-        
-        if record.levelno >= logging.ERROR:
-            symbol = LogSymbols.ERROR
-            color = Fore.RED
-            record.levelname = "ERROR"
-        elif record.levelno >= logging.WARNING:
-            symbol = LogSymbols.WARNING
-            color = Fore.YELLOW
-            record.levelname = "WARN"
-        elif is_success:
-            symbol = LogSymbols.SUCCESS
-            color = Fore.GREEN
-        elif "test" in original_msg.lower():
-            symbol = LogSymbols.TEST
-        elif "api" in original_msg.lower():
-            symbol = LogSymbols.API
-        elif "model" in original_msg.lower():
-            symbol = LogSymbols.MODEL
-            
-        # Add context symbols
-        if "starting" in original_msg.lower():
-            symbol = LogSymbols.START
-        elif "finished" in original_msg.lower() or "completed" in original_msg.lower():
-            symbol = LogSymbols.END
-        
-        # Apply color to the entire formatted line
-        record.msg = f"{symbol}  {original_msg}"
-        formatted_msg = super().format(record)
-        
-        # Apply appropriate color to the entire line
-        if record.levelno >= logging.ERROR:
-            colored_msg = f"{Fore.RED}{formatted_msg}{Style.RESET_ALL}"
-        elif record.levelno >= logging.WARNING:
-            colored_msg = f"{Fore.YELLOW}{formatted_msg}{Style.RESET_ALL}"
-        elif is_success:
-            colored_msg = f"{Fore.GREEN}{formatted_msg}{Style.RESET_ALL}"
+        # Create padded colored levelname with consistent width
+        if record.levelname == 'INFO':
+            # INFO needs 3 spaces to match WARNING
+            record.levelname = f"{log_color}{'INFO    '}{Style.RESET_ALL}"
+        elif record.levelname == 'ERROR':
+            # ERROR needs 2 spaces to match WARNING
+            record.levelname = f"{log_color}{'ERROR   '}{Style.RESET_ALL}"
+        elif record.levelname == 'DEBUG':
+            # DEBUG needs 2 spaces to match WARNING
+            record.levelname = f"{log_color}{'DEBUG   '}{Style.RESET_ALL}"
+        elif record.levelname == 'CRITICAL':
+            # CRITICAL is longer than WARNING
+            record.levelname = f"{log_color}{record.levelname}{Style.RESET_ALL}"
         else:
-            colored_msg = f"{color}{formatted_msg}{Style.RESET_ALL}"
+            # WARNING and others
+            record.levelname = f"{log_color}{record.levelname}{Style.RESET_ALL}"
         
-        # Restore original record state
-        record.msg = original_msg
+        # Save original message
+        original_msg = record.msg
+        
+        if 'LLM' in original_msg:
+            record.msg = f"{LogSymbols.MODEL} {original_msg}"
+        elif 'API' in original_msg:
+            record.msg = f"{LogSymbols.API} {original_msg}"
+        elif 'TEST' in original_msg:
+            record.msg = f"{LogSymbols.TEST} {original_msg}"
+        else:
+            record.msg = f"{log_symbol} {original_msg}"
+        
+        record.formatted = True
+        result = super().format(record)
+        
+        # Restore original values for potential reuse
         record.levelname = original_levelname
+        record.msg = original_msg
         
-        return colored_msg
+        return result
 
 class FileFormatter(logging.Formatter):
-    """Clean formatter for file output without escape codes."""
+    """Clean formatter for log files without colors."""
     
-    def format(self, record):
-        # Add symbols based on content without color codes
-        symbol = LogSymbols.INFO
+    SYMBOLS = {
+        'DEBUG': LogSymbols.DEBUG,
+        'INFO': LogSymbols.INFO,
+        'WARNING': LogSymbols.WARNING,
+        'ERROR': LogSymbols.ERROR,
+        'CRITICAL': LogSymbols.CRITICAL
+    }
+    
+    def format(self, record: logging.LogRecord) -> str:
+        # Check if message already contains formatting
+        if hasattr(record, 'formatted') and record.formatted:
+            formatted_message = super().format(record)
+            # Strip ANSI escape sequences for file output
+            return ANSI_ESCAPE_PATTERN.sub('', formatted_message)
         
-        if record.levelno >= logging.ERROR:
-            symbol = LogSymbols.ERROR
-        elif record.levelno >= logging.WARNING:
-            symbol = LogSymbols.WARNING
-        elif "success" in record.msg.lower() or "completed" in record.msg.lower():
-            symbol = LogSymbols.SUCCESS
-        elif "test" in record.msg.lower():
-            symbol = LogSymbols.TEST
-        elif "api" in record.msg.lower():
-            symbol = LogSymbols.API
-        elif "model" in record.msg.lower():
-            symbol = LogSymbols.MODEL
-            
-        # Add context symbols
-        if "starting" in record.msg.lower():
-            symbol = LogSymbols.START
-        elif "finished" in record.msg.lower() or "completed" in record.msg.lower():
-            symbol = LogSymbols.END
+        log_symbol = self.SYMBOLS.get(record.levelname, "")
         
-        # Format message with symbol but no color
+        # Save original values
+        original_levelname = record.levelname
         original_msg = record.msg
-        record.msg = f"{symbol}  {record.msg}"
         
-        # Format and return
-        formatted = super().format(record)
+        # Check if this is a TERMINAL: message to avoid double formatting
+        if isinstance(original_msg, str) and original_msg.startswith("TERMINAL:"):
+            # Just clean ANSI sequences and pass through
+            record.msg = original_msg
+        else:
+            if 'LLM' in original_msg:
+                record.msg = f"{LogSymbols.MODEL} {original_msg}"
+            elif 'API' in original_msg:
+                record.msg = f"{LogSymbols.API} {original_msg}"
+            elif 'TEST' in original_msg:
+                record.msg = f"{LogSymbols.TEST} {original_msg}"
+            else:
+                record.msg = f"{log_symbol} {original_msg}"
+        
+        record.formatted = True
+        formatted_message = super().format(record)
+        
+        # Restore original values
+        record.levelname = original_levelname
         record.msg = original_msg
-        return formatted
+        delattr(record, 'formatted') if hasattr(record, 'formatted') else None
+        
+        # Strip ANSI escape sequences for file output
+        return ANSI_ESCAPE_PATTERN.sub('', formatted_message)
+
+class StdoutInterceptor(io.TextIOBase):
+    """Class to intercept stdout/stderr and log it."""
+    def __init__(self, original_stream: TextIO, logger: logging.Logger, level: int = logging.INFO):
+        self.original_stream = original_stream
+        self.logger = logger
+        self.level = level
+        self.buffer = ""
+        self.in_logging = False  # To prevent recursive logging
+
+    def write(self, text: str) -> int:
+        # Prevent recursive logging - don't log if we're already in a logging context
+        if self.in_logging:
+            return self.original_stream.write(text)
+        
+        self.in_logging = True
+        try:
+            if text.strip():  # Only log non-empty lines
+                # Clean the text of ANSI escape sequences for comparison and logging
+                clean_text = ANSI_ESCAPE_PATTERN.sub('', text)
+                
+                # Skip if this appears to be a log message (to avoid duplicates)
+                if not (clean_text.startswith("17:") and "│" in clean_text[:20]):
+                    self.buffer += text
+                    if '\n' in text:
+                        lines = self.buffer.split('\n')
+                        for line in lines[:-1]:  # Process all complete lines
+                            if line.strip():  # Skip empty lines
+                                # Generate a clean version for logging and hash for deduplication
+                                clean_line = ANSI_ESCAPE_PATTERN.sub('', line.rstrip())
+                                # Skip logging if this line appears to be a log formatting artifact
+                                if clean_line and not clean_line.startswith("17:") and "│" not in clean_line[:20]:
+                                    # Only log if we haven't logged this exact message before
+                                    msg_hash = f"{clean_line}"
+                                    if msg_hash not in LOGGED_MESSAGES:
+                                        LOGGED_MESSAGES.add(msg_hash)
+                                        self.logger.log(self.level, f"TERMINAL: {clean_line}")
+                        self.buffer = lines[-1]  # Keep the last incomplete line
+                
+            # Always write to the original stream
+            return self.original_stream.write(text)
+        finally:
+            self.in_logging = False
+
+    def flush(self) -> None:
+        # If there's anything left in the buffer, log it
+        if self.buffer.strip() and not self.in_logging:
+            self.in_logging = True
+            try:
+                clean_buffer = ANSI_ESCAPE_PATTERN.sub('', self.buffer.rstrip())
+                # Only log if we haven't logged this exact message before
+                msg_hash = f"{clean_buffer}"
+                if msg_hash not in LOGGED_MESSAGES and not clean_buffer.startswith("17:") and "│" not in clean_buffer[:20]:
+                    LOGGED_MESSAGES.add(msg_hash)
+                    self.logger.log(self.level, f"TERMINAL: {clean_buffer}")
+                self.buffer = ""
+            finally:
+                self.in_logging = False
+        self.original_stream.flush()
+        
+    def isatty(self) -> bool:
+        return hasattr(self.original_stream, 'isatty') and self.original_stream.isatty()
         
 class Logger:
     """Clean logger configuration with separate formatters for console and file."""
@@ -154,7 +248,7 @@ class Logger:
         # Create console handler with colored formatter
         console_handler = logging.StreamHandler(sys.stdout)
         console_formatter = ConsoleFormatter(
-            fmt='%(asctime)s │ %(levelname)-7s │ %(name)-12s │ %(message)s',
+            fmt='%(asctime)s │ %(levelname)s │ %(name)-12s │ %(message)s',
             datefmt='%H:%M:%S'
         )
         console_handler.setFormatter(console_formatter)
@@ -176,6 +270,18 @@ class Logger:
             except Exception as e:
                 print(f"{LogSymbols.ERROR} Could not create log file: {e}")
         
+        # Intercept stdout and stderr
+        stdout_interceptor = StdoutInterceptor(sys.stdout, root_logger, logging.INFO)
+        stderr_interceptor = StdoutInterceptor(sys.stderr, root_logger, logging.ERROR)
+        
+        # Save original streams for restoration if needed
+        sys._original_stdout = sys.stdout
+        sys._original_stderr = sys.stderr
+        
+        # Replace with interceptors
+        sys.stdout = stdout_interceptor
+        sys.stderr = stderr_interceptor
+        
         # Log startup
         divider = f"{LogSymbols.DIVIDER * 50}"
         root_logger.info(f"NeuroPrompt Starting {LogSymbols.START}")
@@ -190,4 +296,11 @@ main_logger = Logger.setup(log_file=default_log_file)
 def get_logger(name: str) -> logging.Logger:
     """Get a logger instance with the specified name."""
     module_name = name.split('.')[-1]
-    return logging.getLogger(module_name) 
+    return logging.getLogger(module_name)
+
+def restore_stdout_stderr():
+    """Restore original stdout and stderr streams."""
+    if hasattr(sys, '_original_stdout'):
+        sys.stdout = sys._original_stdout
+    if hasattr(sys, '_original_stderr'):
+        sys.stderr = sys._original_stderr 
